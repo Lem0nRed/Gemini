@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WebAR Saturn Particle System</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Courier New', monospace; }
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        #video-feed { position: absolute; bottom: 10px; right: 10px; width: 160px; height: 120px; z-index: 2; opacity: 0.5; border: 1px solid #444; transform: scaleX(-1); border-radius: 8px;}
+        #ui-layer { position: absolute; top: 20px; left: 20px; color: #00ffcc; z-index: 10; pointer-events: none; }
+        .loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 24px; z-index: 20; background: rgba(0,0,0,0.8); padding: 20px; border-radius: 10px; display: block;}
+        h1 { font-size: 18px; margin: 0; text-shadow: 0 0 10px #00ffcc; }
+        p { font-size: 12px; opacity: 0.8; line-height: 1.5; }
+        .key-point { color: #ffaa00; font-weight: bold; }
+    </style>
+    <script src="https://unpkg.com/three@0.146.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div id="loading" class="loading">正在初始化视觉核心...<br>请允许摄像头权限</div>
+<div id="ui-layer">
+    <h1>🪐 土星粒子场 (Saturn Particle Field)</h1>
+    <p>状态: <span id="status">等待手势...</span></p>
+    <p>交互指南：<br>
+    1. <span class="key-point">张开/握拳</span>: 缩放星球<br>
+    2. <span class="key-point">捏合(拇指+食指)</span>: 控制旋转<br>
+    3. <span class="key-point">快速挥手</span>: 产生物理风暴<br>
+    4. <span class="key-point">手掌前后移动</span>: 深度控制</p>
+    <p>FPS: <span id="fps">0</span> | 粒子数: 16,000</p>
+</div>
+
+<video id="video-feed" autoplay playsinline muted></video>
+<div id="canvas-container"></div>
+
+<script>
+    // --- 配置参数 ---
+    const CONFIG = {
+        particleCount: 16000,
+        colors: [0x8B4513, 0xD2B48C, 0xF4A460, 0xDEB887, 0xCD853F], // 土星棕色系
+        springStrength: 0.03, // 归位弹力 (硬度)
+        friction: 0.92,       // 空气阻力 (丝滑感)
+        stormPower: 3.5,      // 挥手风力倍率
+        baseRadius: 100,      // 星球基础半径
+        ringInner: 140,
+        ringOuter: 220
+    };
+
+    // --- 全局变量 ---
+    let scene, camera, renderer, particlesMesh;
+    let originalPositions, currentPositions, velocities; // 物理数据 Buffer
+    let handLandmarks = null;
+    let clock = new THREE.Clock();
+    
+    // 交互状态
+    let interactionState = {
+        pinchDistance: 0,
+        isPinching: false,
+        handCentroid: new THREE.Vector3(),
+        prevHandCentroid: new THREE.Vector3(),
+        handVelocity: new THREE.Vector3(),
+        handOpenness: 1.0, // 1.0 = normal, >1 open, <1 closed
+        handDepth: 1.0,
+        rotationSpeed: 0.002
+    };
+
+    // --- 初始化 Three.js ---
+    function initThree() {
+        const container = document.getElementById('canvas-container');
+        scene = new THREE.Scene();
+        // 增加一点雾效增强深度感
+        scene.fog = new THREE.FogExp2(0x050505, 0.0008);
+
+        camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 3000);
+        camera.position.z = 600;
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        createSaturnParticles();
+        window.addEventListener('resize', onWindowResize, false);
+    }
+
+    // --- 创建粒子系统 (土星结构) ---
+    function createSaturnParticles() {
+        const geometry = new THREE.BufferGeometry();
+        originalPositions = new Float32Array(CONFIG.particleCount * 3);
+        currentPositions = new Float32Array(CONFIG.particleCount * 3);
+        velocities = new Float32Array(CONFIG.particleCount * 3); // 速度物理量
+        const colors = new Float32Array(CONFIG.particleCount * 3);
+
+        const colorPalette = CONFIG.colors.map(c => new THREE.Color(c));
+
+        for (let i = 0; i < CONFIG.particleCount; i++) {
+            let x, y, z;
+            let isRing = Math.random() > 0.4; // 60% 粒子在环上，40% 在球体
+
+            if (!isRing) {
+                // 球体分布 (Planet Body)
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos((Math.random() * 2) - 1);
+                const r = CONFIG.baseRadius * Math.cbrt(Math.random()); // 均匀分布
+                x = r * Math.sin(phi) * Math.cos(theta);
+                y = r * Math.sin(phi) * Math.sin(theta);
+                z = r * Math.cos(phi);
+            } else {
+                // 环状分布 (Ring)
+                const theta = Math.random() * Math.PI * 2;
+                const r = CONFIG.ringInner + Math.random() * (CONFIG.ringOuter - CONFIG.ringInner);
+                x = r * Math.cos(theta);
+                z = r * Math.sin(theta); // 环平铺在 XZ 平面
+                y = (Math.random() - 0.5) * 5; // 极薄的厚度
+                
+                // 给环增加一点倾角
+                const tempY = y * Math.cos(0.4) - z * Math.sin(0.4);
+                const tempZ = y * Math.sin(0.4) + z * Math.cos(0.4);
+                y = tempY; z = tempZ;
+            }
+
+            // 填充 Buffer
+            originalPositions[i * 3] = x;
+            originalPositions[i * 3 + 1] = y;
+            originalPositions[i * 3 + 2] = z;
+
+            currentPositions[i * 3] = x;
+            currentPositions[i * 3 + 1] = y;
+            currentPositions[i * 3 + 2] = z;
+
+            // 颜色分配
+            const color = colorPalette[Math.floor(Math.random() * colorPalette.length)];
+            colors[i * 3] = color.r;
+            colors[i * 3 + 1] = color.g;
+            colors[i * 3 + 2] = color.b;
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(currentPositions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        const material = new THREE.PointsMaterial({
+            size: 2.5,
+            vertexColors: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+            transparent: true,
+            opacity: 0.8
+        });
+
+        particlesMesh = new THREE.Points(geometry, material);
+        scene.add(particlesMesh);
+    }
+
+    // --- MediaPipe 处理逻辑 ---
+    function onResults(results) {
+        document.getElementById('loading').style.display = 'none';
+        
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const landmarks = results.multiHandLandmarks[0];
+            handLandmarks = landmarks;
+
+            // 1. 计算手掌质心 (近似)
+            const wrist = landmarks[0];
+            const middleFinger = landmarks[9];
+            
+            // 映射 MediaPipe (0-1) 到 Three.js 世界坐标 (近似投影)
+            // 假设 Z=0 平面，视口宽度映射
+            const vector = new THREE.Vector3(
+                (1 - middleFinger.x) * 2 - 1,
+                -(middleFinger.y) * 2 + 1,
+                0.5
+            );
+            vector.unproject(camera);
+            const dir = vector.sub(camera.position).normalize();
+            const distance = -camera.position.z / dir.z; // 投射到 Z=0
+            const worldPos = camera.position.clone().add(dir.multiplyScalar(distance));
+            
+            interactionState.prevHandCentroid.copy(interactionState.handCentroid);
+            interactionState.handCentroid.copy(worldPos);
+
+            // 2. 计算手速 (风暴触发)
+            const velocity = new THREE.Vector3().subVectors(interactionState.handCentroid, interactionState.prevHandCentroid);
+            interactionState.handVelocity.lerp(velocity, 0.5); // 简单平滑
+
+            // 3. 捏合检测 (食指8 - 拇指4)
+            const p4 = landmarks[4];
+            const p8 = landmarks[8];
+            const pinchDist = Math.hypot(p8.x - p4.x, p8.y - p4.y);
+            interactionState.isPinching = pinchDist < 0.05;
+
+            // 4. 手掌张开程度 (计算指尖到手腕的平均距离)
+            const tips = [8, 12, 16, 20];
+            let avgDist = 0;
+            tips.forEach(idx => {
+                avgDist += Math.hypot(landmarks[idx].x - landmarks[0].x, landmarks[idx].y - landmarks[0].y);
+            });
+            avgDist /= 4;
+            // 归一化: 0.2 (闭合) ~ 0.5 (张开) -> 映射到 0.5 ~ 2.0
+            interactionState.handOpenness = THREE.MathUtils.mapLinear(avgDist, 0.1, 0.5, 0.5, 2.5);
+
+            // 5. 深度检测 (手部 Bounding Box 面积)
+            // 简单用手腕和中指的距离作为深度的反比代理
+            const depthProxy = Math.hypot(wrist.x - middleFinger.x, wrist.y - middleFinger.y);
+            interactionState.handDepth = THREE.MathUtils.mapLinear(depthProxy, 0.1, 0.4, 0.8, 1.5);
+
+            updateUI("手势追踪中");
+        } else {
+            handLandmarks = null;
+            // 无手时，速度衰减
+            interactionState.handVelocity.multiplyScalar(0.9);
+            // 缓慢恢复默认缩放
+            interactionState.handOpenness = THREE.MathUtils.lerp(interactionState.handOpenness, 1.0, 0.05);
+            updateUI("等待手势...");
+        }
+    }
+
+    function updateUI(status) {
+        document.getElementById('status').innerText = status;
+        if(interactionState.isPinching) document.getElementById('status').innerText = "状态: 旋转锁定";
+        if(interactionState.handVelocity.length() > 20) document.getElementById('status').innerText = "状态: 🌪️ 粒子风暴";
+    }
+
+    // --- 核心物理循环 ---
+    function animate() {
+        requestAnimationFrame(animate);
+        
+        const positions = particlesMesh.geometry.attributes.position.array;
+        
+        // 旋转逻辑
+        if (interactionState.isPinching) {
+            // 捏合时根据手的位置差异旋转
+            particlesMesh.rotation.y += (interactionState.handCentroid.x * 0.0001);
+            particlesMesh.rotation.x -= (interactionState.handCentroid.y * 0.0001);
+        } else {
+            particlesMesh.rotation.y += interactionState.rotationSpeed;
+        }
+
+        // 深度缩放 (整体缩放)
+        const targetScale = interactionState.handDepth;
+        particlesMesh.scale.setScalar(THREE.MathUtils.lerp(particlesMesh.scale.x, targetScale, 0.05));
+
+        // 物理迭代
+        for (let i = 0; i < CONFIG.particleCount; i++) {
+            const idx = i * 3;
+
+            // 1. 获取当前状态
+            let px = positions[idx];
+            let py = positions[idx + 1];
+            let pz = positions[idx + 2];
+
+            let vx = velocities[idx];
+            let vy = velocities[idx + 1];
+            let vz = velocities[idx + 2];
+
+            // 2. 计算目标位置 (基于手掌张开程度变形)
+            // 如果手张开，目标位置向外扩散
+            let ox = originalPositions[idx] * interactionState.handOpenness;
+            let oy = originalPositions[idx + 1] * interactionState.handOpenness;
+            let oz = originalPositions[idx + 2] * interactionState.handOpenness;
+
+            // 3. 计算弹力 (Hooke's Law): F = k * (target - current)
+            let fx = (ox - px) * CONFIG.springStrength;
+            let fy = (oy - py) * CONFIG.springStrength;
+            let fz = (oz - pz) * CONFIG.springStrength;
+
+            // 4. 计算风暴干扰力 (Interaction Force)
+            if (handLandmarks) {
+                // 将粒子转到世界坐标对比，或者将手转到局部坐标
+                // 这里简单处理：手的位置相对于屏幕中心，粒子也是
+                // 计算粒子与手的距离
+                // 注意：particlesMesh 有旋转，需简单逆变换或只计算屏幕空间距离
+                
+                // 简化：假设手在 Z=200 处产生风场
+                let dx = px - interactionState.handCentroid.x;
+                let dy = py - interactionState.handCentroid.y;
+                let distSq = dx*dx + dy*dy;
+
+                // 如果手速够快，且粒子在附近
+                const speed = interactionState.handVelocity.length();
+                if (speed > 5.0 && distSq < 40000) { // 200 unit radius
+                    const force = (10000 / (distSq + 100)) * speed * CONFIG.stormPower;
+                    // 沿着手速方向吹，并带一点爆炸扩散
+                    fx += interactionState.handVelocity.x * force * 0.5 + (dx * force * 0.1);
+                    fy += interactionState.handVelocity.y * force * 0.5 + (dy * force * 0.1);
+                    fz += interactionState.handVelocity.z * force * 0.5;
+                }
+            }
+
+            // 5. 积分 (Velocity += Acceleration, Position += Velocity)
+            vx += fx;
+            vy += fy;
+            vz += fz;
+
+            // 6. 阻尼 (Friction)
+            vx *= CONFIG.friction;
+            vy *= CONFIG.friction;
+            vz *= CONFIG.friction;
+
+            // 7. 更新位置
+            positions[idx] = px + vx;
+            positions[idx + 1] = py + vy;
+            positions[idx + 2] = pz + vz;
+
+            // 保存速度
+            velocities[idx] = vx;
+            velocities[idx + 1] = vy;
+            velocities[idx + 2] = vz;
+        }
+
+        particlesMesh.geometry.attributes.position.needsUpdate = true;
+        
+        // 更新 FPS
+        document.getElementById('fps').innerText = Math.round(1 / clock.getDelta());
+        renderer.render(scene, camera);
+    }
+
+    // --- 启动流程 ---
+    initThree();
+    
+    const videoElement = document.getElementById('video-feed');
+    const hands = new Hands({locateFile: (file) => {
+        return `https://unpkg.com/@mediapipe/hands/${file}`;
+    }});
+    
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+    
+    hands.onResults(onResults);
+    
+    const cameraUtils = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 640,
+        height: 480
+    });
+    
+    cameraUtils.start().then(()=> {
+        console.log("Camera started");
+        animate();
+    }).catch(err => {
+        console.error("Camera error:", err);
+        document.getElementById('loading').innerText = "摄像头启动失败，请检查权限或HTTPS环境";
+    });
+
+    function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+</script>
+</body>
+</html>
